@@ -4,8 +4,8 @@
     "type": "git",
     "url": "git+https://github.com/nishit130/dsh-notification.git"
   },
-  "version": "0.1.2",
-  "description": "Desktop + webhook notifications when your DeepSeek Harness agent finishes a turn, hits an error, or needs approval.",
+  "version": "0.1.2-local.1",
+  "description": "Lightweight DeepSeek Harness host desktop and webhook notifications with subagent-tree settlement and user-question alerts.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -26,14 +26,17 @@
     "dsh",
     "deepseek-harness",
     "dsh-plugin",
-    "notifications",
+    "notification",
     "webhook"
   ],
   "license": "MIT",
   "peerDependencies": {
-    "@deepseek-ai/schemastery": "^3"
+    "@deepseek-ai/schemastery": "^3",
+    "@deepseek-ai/dsh-scope": ">=0.1.2-alpha.2"
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.5",
+    "@deepseek-ai/dsh-scope": "^0.2.1-rc.3",
     "@deepseek-ai/schemastery": "^3.18.1"
   },
   "dsh": {
