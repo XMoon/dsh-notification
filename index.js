@@ -5,8 +5,9 @@
  * Additions:
  *  - truncated last MAIN agent reply in completion webhooks
  *  - no subagent notifications
- *  - defer completion until all descendant subagent runs settle and the main
- *    agent stays idle through a short quiet period
+ *  - defer completion until descendant subagent runs and (optionally)
+ *    background jobs settle, and the main agent stays idle through a short
+ *    quiet period
  *  - immediate user-questions/request alerts (without intercepting answers)
  *
  * Uses the Host's @deepseek-ai/dsh-scope to identify the parent of both local
@@ -35,6 +36,8 @@ export const Config = Schema.object({
     .description('Maximum number of Unicode characters in notification bodies.'),
   waitForSubagents: Schema.boolean().default(true)
     .description('Suppress intermediate completion until subagent executions have settled.'),
+  waitForBackgroundJobs: Schema.boolean().default(false)
+    .description('Suppress intermediate completion until background jobs have settled.'),
   settleDelayMs: Schema.number().default(1000)
     .description('Time the entire agent tree must remain idle before notification.'),
   desktop: Schema.boolean().default(true)
@@ -112,6 +115,9 @@ export function apply(ctx, config) {
   const runs = new Map()    // SubagentRunId -> root SessionId
   const active = new Map()  // root SessionId -> Set<SubagentRunId>
   const questionsSeen = new WeakSet()
+  // Opt-in, unlike `waitForSubagents`: background jobs are usually long-running
+  // by design, so the default does not hold the completion for them.
+  const waitForJobs = settings.waitForBackgroundJobs === true
 
   function agentId(agent) { return String(agent?.session?.id ?? agent?.id ?? '') }
 
@@ -217,7 +223,8 @@ export function apply(ctx, config) {
   // Background jobs outlive the turn that started them: the main agent goes
   // idle as soon as `run_in_background` returns, so job activity is a second
   // reason a task group is still running. The registry's own projection is the
-  // authority; `settled` is the only edge that ends a job.
+  // authority; `settled` is the only edge that ends a job. This wait is opt-in
+  // (`waitForBackgroundJobs`, default off).
   const liveJobs = new Map() // root SessionId -> Set<JobId>
   // A job's owner is its DIRECT session, which may be a subagent. Resolution
   // needs the live agent, and that agent can be disposed before its job
@@ -243,7 +250,7 @@ export function apply(ctx, config) {
   }
 
   function treeBusy(rootId) {
-    return runningRuns(rootId) || runningJobs(rootId)
+    return (settings.waitForSubagents !== false && runningRuns(rootId)) || runningJobs(rootId)
   }
 
   /** Check descendant *live* Agents as well as the start/end run ledger.
@@ -281,7 +288,7 @@ export function apply(ctx, config) {
     const state = roots.get(rootId)
     if (!state || state.beganAt == null || state.agent?.status !== 'idle') return
     stopTimer(state)
-    if (settings.waitForSubagents !== false && treeBusy(rootId)) return
+    if (treeBusy(rootId)) return
 
     const delay = Math.max(0, Number(settings.settleDelayMs ?? 1000) || 0)
     const generation = state.generation
@@ -293,7 +300,7 @@ export function apply(ctx, config) {
         if (settings.waitForSubagents !== false && await descendantsBusy(rootId)) return
         if (roots.get(rootId) !== state || state.generation !== generation) return
         if (state.agent.status !== 'idle') return
-        if (settings.waitForSubagents !== false && treeBusy(rootId)) return
+        if (treeBusy(rootId)) return
 
         const elapsed = Date.now() - state.beganAt
         if (elapsed >= (settings.minTurnDurationMs ?? 5000)) {
@@ -428,42 +435,47 @@ export function apply(ctx, config) {
   })
 
   // Background jobs are their own authority: a settled job re-checks the
-  // waiting completion, because settling wakes no `agent/status` edge.
-  // Subscribed from an injected child fiber so the registration unwinds with
-  // this plugin; the `live` flag additionally stops an in-flight callback.
-  let live = true
-  ctx.effect(() => () => { live = false }, 'dsh-notification: job ledger')
-  ctx.inject(['jobs'], (jobCtx) => {
-    const unsubscribe = jobCtx.jobs.events.subscribe({ owners: 'scope' }, (event) => {
-      if (!live) return
-      const job = event.job
-      const owner = job?.owner
-      if (owner == null) return
-      const jobId = String(job.id)
-      if (event.type === 'settled') {
-        // Registration is the only edge where the owner is guaranteed live, so
-        // that edge decides the root and this one reuses the decision. Re-deriving
-        // here would mis-attribute (or drop) a job whose child agent has already
-        // been disposed, leaving the parent silently un-notified forever.
-        const rootId = jobRoot.get(jobId) ?? String(owner)
-        jobRoot.delete(jobId)
-        trackJob(rootId, job.id, false)
-        if (event.cause === 'teardown') return
-        afterJobSettled(rootId)
-        return
-      }
-      if (event.type === 'registered') {
-        // A subagent inherits the parent's toolset, so it can start a background
-        // job of its own. That job's owner is the CHILD session: attribute it to
-        // the same root the subagent run ledger uses, or the parent completes
-        // while its delegated work still runs.
-        const rootId = rootIdForAgent(service('agents')?.get?.(owner)) ?? String(owner)
-        jobRoot.set(jobId, rootId)
-        trackJob(rootId, job.id, true)
-        const state = roots.get(rootId)
-        if (state) stopTimer(state)
-      }
+  // waiting completion, because settling wakes no `agent/status` edge. With
+  // `waitForBackgroundJobs: false` (the default) the ledger is not maintained,
+  // so job registration and settlement can neither defer nor reset the
+  // completion timer. Subscribed from an injected child fiber so the
+  // registration unwinds with this plugin; the `live` flag additionally stops
+  // an in-flight callback.
+  if (waitForJobs) {
+    let live = true
+    ctx.effect(() => () => { live = false }, 'dsh-notification: job ledger')
+    ctx.inject(['jobs'], (jobCtx) => {
+      const unsubscribe = jobCtx.jobs.events.subscribe({ owners: 'scope' }, (event) => {
+        if (!live) return
+        const job = event.job
+        const owner = job?.owner
+        if (owner == null) return
+        const jobId = String(job.id)
+        if (event.type === 'settled') {
+          // Registration is the only edge where the owner is guaranteed live, so
+          // that edge decides the root and this one reuses the decision. Re-deriving
+          // here would mis-attribute (or drop) a job whose child agent has already
+          // been disposed, leaving the parent silently un-notified forever.
+          const rootId = jobRoot.get(jobId) ?? String(owner)
+          jobRoot.delete(jobId)
+          trackJob(rootId, job.id, false)
+          if (event.cause === 'teardown') return
+          afterJobSettled(rootId)
+          return
+        }
+        if (event.type === 'registered') {
+          // A subagent inherits the parent's toolset, so it can start a background
+          // job of its own. That job's owner is the CHILD session: attribute it to
+          // the same root the subagent run ledger uses, or the parent completes
+          // while its delegated work still runs.
+          const rootId = rootIdForAgent(service('agents')?.get?.(owner)) ?? String(owner)
+          jobRoot.set(jobId, rootId)
+          trackJob(rootId, job.id, true)
+          const state = roots.get(rootId)
+          if (state) stopTimer(state)
+        }
+      })
+      jobCtx.effect(() => unsubscribe, 'dsh-notification: job events')
     })
-    jobCtx.effect(() => unsubscribe, 'dsh-notification: job events')
-  })
+  }
 }

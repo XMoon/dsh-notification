@@ -127,6 +127,7 @@ test('exports a named plugin with a validating schema', () => {
   assert.equal(config.minTurnDurationMs, 5000)
   assert.equal(config.maxBodyChars, 200)
   assert.equal(config.waitForSubagents, true)
+  assert.equal(config.waitForBackgroundJobs, false)
   assert.equal(config.settleDelayMs, 1000)
   assert.equal(config.browser, true)
 })
@@ -326,7 +327,7 @@ function jobRegistry() {
 
 test('a background job defers the completion until it settles', async (t) => {
   const jobs = jobRegistry()
-  const { calls, root, status } = await fixture(t, { jobs })
+  const { calls, root, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   status(agent, 'running')
   // `run_in_background` registers the job, then the turn returns and the agent goes idle.
@@ -342,7 +343,7 @@ test('a background job defers the completion until it settles', async (t) => {
 
 test('a teardown settlement does not release a completion', async (t) => {
   const jobs = jobRegistry()
-  const { calls, root, status } = await fixture(t, { jobs })
+  const { calls, root, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   status(agent, 'running')
   jobs.registered('bash-1')
@@ -356,7 +357,7 @@ test('a teardown settlement does not release a completion', async (t) => {
 
 test('a job owned by another session does not defer this one', async (t) => {
   const jobs = jobRegistry()
-  const { calls, root, status } = await fixture(t, { jobs })
+  const { calls, root, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   status(agent, 'running')
   jobs.registered('bash-other', 'some-other-session')
@@ -641,7 +642,7 @@ test('browser half still notifies a plain main completion', () => {
 
 test('two background jobs both defer the completion', async (t) => {
   const jobs = jobRegistry()
-  const { calls, root, status } = await fixture(t, { jobs })
+  const { calls, root, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   status(agent, 'running')
   jobs.registered('bash-1')
@@ -661,7 +662,7 @@ test('two background jobs both defer the completion', async (t) => {
 
 test('a leftover job registered before the turn still releases the completion', async (t) => {
   const jobs = jobRegistry()
-  const { calls, root, status } = await fixture(t, { jobs })
+  const { calls, root, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   jobs.registered('old-job')
   status(agent, 'running')
@@ -676,7 +677,7 @@ test('a leftover job registered before the turn still releases the completion', 
 
 test('a background job started by a subagent still defers the main completion', async (t) => {
   const jobs = jobRegistry()
-  const { calls, root, child, status } = await fixture(t, { jobs })
+  const { calls, root, child, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   const sub = child('child')
   status(agent, 'running')
@@ -706,7 +707,7 @@ test('the empty-reply fallback obeys maxBodyChars', async (t) => {
 
 test('a subagent job whose owner was disposed still releases the root completion', async (t) => {
   const jobs = jobRegistry()
-  const { calls, registry, root, child, status } = await fixture(t, { jobs })
+  const { calls, registry, root, child, status } = await fixture(t, { jobs, overrides: { waitForBackgroundJobs: true } })
   const agent = root()
   const sub = child('child')
   status(agent, 'running')
@@ -720,4 +721,109 @@ test('a subagent job whose owner was disposed still releases the root completion
   jobs.settled('child-job', sub.id)
   await sleep(40)
   assert.equal(calls.length, 1, 'the remembered root releases even after the owner is gone')
+})
+
+test('waitForSubagents on + waitForBackgroundJobs off: only the subagent holds the completion', async (t) => {
+  const jobs = jobRegistry()
+  const { calls, root, emit, status } = await fixture(t, {
+    jobs, overrides: { waitForSubagents: true, waitForBackgroundJobs: false },
+  })
+  const agent = root()
+  status(agent, 'running')
+  emit(agent, 'subagent/start', { runId: 'run-1', id: 'child', provider: 'p', local: true })
+  jobs.registered('bash-1')
+  status(agent, 'idle')
+  await sleep(20)
+  assert.equal(calls.length, 0, 'the running subagent still holds the completion')
+
+  emit(agent, 'subagent/end', { runId: 'run-1', id: 'child', provider: 'p', local: true, stopReason: 'completed' })
+  await sleep(20)
+  assert.equal(calls.length, 1, 'the still-running background job must not hold the completion')
+
+  // The acceptance case: the job settles long after the notification.
+  jobs.settled('bash-1')
+  await sleep(20)
+  assert.equal(calls.length, 1, 'a late job settlement must not notify a second time')
+})
+
+test('waitForSubagents on + waitForBackgroundJobs on: both the run and the job hold the completion', async (t) => {
+  const jobs = jobRegistry()
+  const { calls, root, emit, status } = await fixture(t, {
+    jobs, overrides: { waitForSubagents: true, waitForBackgroundJobs: true },
+  })
+  const agent = root()
+  status(agent, 'running')
+  emit(agent, 'subagent/start', { runId: 'run-1', id: 'child', provider: 'p', local: true })
+  jobs.registered('bash-1')
+  status(agent, 'idle')
+  await sleep(20)
+  assert.equal(calls.length, 0)
+
+  emit(agent, 'subagent/end', { runId: 'run-1', id: 'child', provider: 'p', local: true, stopReason: 'completed' })
+  await sleep(20)
+  assert.equal(calls.length, 0, 'the background job still runs')
+
+  jobs.settled('bash-1')
+  await sleep(20)
+  assert.equal(calls.length, 1)
+})
+
+test('waitForSubagents off + waitForBackgroundJobs off: the idle edge completes immediately', async (t) => {
+  const jobs = jobRegistry()
+  const { calls, root, emit, status } = await fixture(t, {
+    jobs, overrides: { waitForSubagents: false, waitForBackgroundJobs: false },
+  })
+  const agent = root()
+  status(agent, 'running')
+  emit(agent, 'subagent/start', { runId: 'run-1', id: 'child', provider: 'p', local: true })
+  jobs.registered('bash-1')
+  status(agent, 'idle')
+  await sleep(20)
+  assert.equal(calls.length, 1, 'neither a run nor a job defers the completion')
+
+  emit(agent, 'subagent/end', { runId: 'run-1', id: 'child', provider: 'p', local: true, stopReason: 'completed' })
+  await sleep(20)
+  jobs.settled('bash-1')
+  await sleep(20)
+  assert.equal(calls.length, 1, 'late edges must not repeat the notification')
+})
+
+test('waitForSubagents off + waitForBackgroundJobs on: only the job holds the completion', async (t) => {
+  const jobs = jobRegistry()
+  const { calls, root, emit, status } = await fixture(t, {
+    jobs, overrides: { waitForSubagents: false, waitForBackgroundJobs: true },
+  })
+  const agent = root()
+  status(agent, 'running')
+  emit(agent, 'subagent/start', { runId: 'run-1', id: 'child', provider: 'p', local: true })
+  jobs.registered('bash-1')
+  status(agent, 'idle')
+  await sleep(20)
+  assert.equal(calls.length, 0, 'the background job holds the completion')
+
+  jobs.settled('bash-1')
+  await sleep(20)
+  assert.equal(calls.length, 1, 'the running subagent must not hold the completion')
+
+  emit(agent, 'subagent/end', { runId: 'run-1', id: 'child', provider: 'p', local: true, stopReason: 'completed' })
+  await sleep(20)
+  assert.equal(calls.length, 1)
+})
+
+test('waitForBackgroundJobs:false neither resets nor re-triggers the completion timer', async (t) => {
+  const jobs = jobRegistry()
+  const { calls, root, status } = await fixture(t, {
+    jobs, overrides: { settleDelayMs: 100, waitForBackgroundJobs: false },
+  })
+  const agent = root()
+  status(agent, 'running')
+  status(agent, 'idle')
+  await sleep(50)
+  jobs.registered('bash-1')
+  await sleep(70)
+  assert.equal(calls.length, 1, 'job registration must not push the pending notification out')
+
+  jobs.settled('bash-1')
+  await sleep(20)
+  assert.equal(calls.length, 1, 'job settlement must not notify again')
 })

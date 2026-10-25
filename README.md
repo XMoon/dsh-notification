@@ -1,9 +1,9 @@
 # dsh-notification
 
 > Desktop, browser + webhook notifications for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
-> on **macOS · Linux · Windows**: know when your agent **finishes its whole task** — background
-> jobs and subagents included — **hits an error**, is **waiting for your approval**, or asks you
-> a **question**.
+> on **macOS · Linux · Windows**: know when your agent **finishes its whole task** — subagent
+> trees included, background jobs too if you opt in — **hits an error**, is **waiting for your
+> approval**, or asks you a **question**.
 
 Long agent turns are the norm: you kick off a task, switch away, and come back to find the agent
 finished five minutes ago — or worse, stuck on an approval prompt the whole time. `dsh-notification`
@@ -14,7 +14,7 @@ not once per intermediate step.
 
 | Event | Trigger | Default |
 |---|---|---|
-| **Agent finished** | the main agent, its background jobs, and its descendant subagent runs have all settled, and the task ran ≥ `minTurnDurationMs` | on |
+| **Agent finished** | the main agent, its descendant subagent runs, and (with `waitForBackgroundJobs`) its background jobs have all settled, and the task ran ≥ `minTurnDurationMs` | on |
 | **Agent error** | `agent/error` for the main agent (steps/turns of subagents are filtered) | on |
 | **Approval needed** | `approval/request` waterfall for the main agent (observe-only; always delegates with `next()`) | on |
 | **Question asked** | `user-questions/request` waterfall for the main agent (observe-only; never answers) | on |
@@ -22,12 +22,13 @@ not once per intermediate step.
 Each notification's summary carries the session title — `[Agent Finished] 面板设置优化实施流程` — so
 several running sessions stay distinguishable at a glance.
 
-Only the **main agent** is reported. Subagent activity never produces its own notification; it only
-delays the main completion until the whole delegation tree has settled. **Background jobs**
-(`run_in_background`) count too: the turn returns as soon as the job id is issued, so a job that is
-still running keeps the completion pending until its `settled` edge. The completion body is the last
-main-agent reply, flattened and truncated to `maxBodyChars` characters — the notifier makes no
-extra model call.
+Only the **main agent** is reported. Subagent activity never produces its own notification; with
+`waitForSubagents` (default on) it delays the main completion until the whole delegation tree has
+settled. **Background jobs** (`run_in_background`) are a separate, opt-in wait: with
+`waitForBackgroundJobs: true` a job that is still running keeps the completion pending until its
+`settled` edge, while with the default `false` the main agent's idle edge notifies right away and
+later job activity never renotifies. The completion body is the last main-agent reply, flattened and
+truncated to `maxBodyChars` characters — the notifier makes no extra model call.
 
 Each event can go to:
 - **Desktop notification** — zero dependencies: `osascript` (macOS), `notify-send` (Linux),
@@ -39,12 +40,23 @@ Each event can go to:
 
 `agent/status → idle` alone fires between steps of one task: a delegating agent goes idle while its
 children still work, and a `run_in_background` job has already returned its id while it keeps
-running. The notifier therefore tracks two ledgers per root session — `subagent/start` …
-`subagent/end` pairs and `ctx.jobs` `registered` … `settled` edges — then requires the whole tree to
-stay idle for `settleDelayMs`. A teardown settlement (`cause: 'teardown'`) has no reader left and
-does not release a completion. A task group notifies **once**; a new turn cancels a pending
-completion instead of queueing a second ping. Set `waitForSubagents: false` to ping on the first
-idle edge instead.
+running. The notifier therefore tracks up to two ledgers per root session — `subagent/start` …
+`subagent/end` pairs and, with `waitForBackgroundJobs`, `ctx.jobs` `registered` … `settled` edges —
+then requires the tracked work to finish and the tree to stay idle for `settleDelayMs`. A teardown
+settlement (`cause: 'teardown'`) has no reader left and does not release a completion. A task group
+notifies **once**; a new turn cancels a pending completion instead of queueing a second ping.
+
+Both waits are independent switches:
+
+| `waitForSubagents` | `waitForBackgroundJobs` | Completion fires when |
+|---|---|---|
+| `true` (default) | `false` (default) | the last descendant subagent run ends |
+| `true` | `true` | both the runs and the jobs have settled |
+| `false` | `false` | the main agent first goes idle |
+| `false` | `true` | the jobs have settled (running subagents do not hold it) |
+
+Set `waitForSubagents: false` to ignore delegation, and `waitForBackgroundJobs: false` (the
+default) to ping as soon as the main turn returns even when a background job is still running.
 
 ## Install
 
@@ -96,6 +108,9 @@ Override the row in your profile's `cordis.patch.yml` (or via the Settings UI):
       name: dsh-notification
       config:
         minTurnDurationMs: 10000        # only notify for turns ≥ 10s
+        waitForSubagents: true          # wait for descendant subagent runs
+        waitForBackgroundJobs: false    # do not wait for background jobs
+        settleDelayMs: 1000
         webhookUrl: 'https://hooks.slack.com/services/XXX/YYY/ZZZ'
         notifyOnApproval: true
         desktop: true
@@ -110,7 +125,8 @@ Override the row in your profile's `cordis.patch.yml` (or via the Settings UI):
 | `notifyOnQuestion` | boolean | `true` | Notify when the main agent asks you a question |
 | `minTurnDurationMs` | number | `5000` | Skip tasks shorter than this, background subagent time included |
 | `maxBodyChars` | number | `200` | Maximum Unicode characters in a notification body |
-| `waitForSubagents` | boolean | `true` | Hold the completion until descendant runs settle |
+| `waitForSubagents` | boolean | `true` | Hold the completion until descendant subagent runs settle |
+| `waitForBackgroundJobs` | boolean | `false` | Hold the completion until background jobs settle; off means job activity never delays or resets it |
 | `settleDelayMs` | number | `1000` | How long the whole tree must stay idle before notifying |
 | `desktop` | boolean | `true` | Native desktop notification on the server host |
 | `browser` | boolean | `true` | Browser `Notification` popups in the Web UI — **host-side value only; the browser half always uses `true`** (see the limit note above) |
@@ -142,6 +158,12 @@ The same format applies to `Agent error`, `Approval Needed`, and `Question Asked
 - **Everything registered through `ctx` is an effect** — listeners, the job-event subscription,
   *and* pending settle timers are removed on unload/hot-reload, so an unloaded plugin can never fire
   a late notification.
+- **The two settlement sources are independent.** `subagent/start … end` drives
+  `waitForSubagents`; `ctx.jobs registered … settled` drives `waitForBackgroundJobs`. Each switch
+  only gates its own ledger, so a long background job never delays a completion the user asked not
+  to wait for, and job edges never reset the settle timer when the job wait is off. The task group
+  still notifies once: after the completion fires, `beganAt` is cleared, so a late job or run edge
+  cannot produce a second ping.
 - **`approval/request` and `user-questions/request` are waterfalls.** This plugin only observes
   them, so each listener always calls `next()` — returning without it would claim the decision or
   the answer and swallow the real responders.

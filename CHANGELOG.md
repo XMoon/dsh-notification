@@ -12,10 +12,15 @@
   (`subagent/start` … `subagent/end`) of the delegating root session, then for the tree to stay
   idle for `settleDelayMs` (default 1s). Intermediate completions between steps are suppressed and
   a task group notifies exactly once. Config: `waitForSubagents`, `settleDelayMs`.
+- **Independent background-job wait**: new `waitForBackgroundJobs` (default `false`), fully
+  decoupled from `waitForSubagents`. With it off — the default — job `registered`/`settled` edges
+  neither defer nor reset the main completion timer, and a late job settlement cannot produce a
+  second notification. Set it to `true` to restore the previous behaviour of waiting for
+  `run_in_background` jobs.
 - **Background-job settlement**: `ctx.jobs` `registered` … `settled` edges per owning session keep
-  the completion pending while a `run_in_background` job runs. A teardown settlement does not
-  release it. This closes the gap where the turn returned with a job id and the completion fired
-  while the job was still working.
+  the completion pending while a `run_in_background` job runs (with `waitForBackgroundJobs: true`).
+  A teardown settlement does not release it. This closes the gap where the turn returned with a job
+  id and the completion fired while the job was still working.
 - **Reply bodies**: the completion body is the last main-agent reply, whitespace-collapsed and
   truncated to `maxBodyChars` Unicode characters (default 200, no extra model call). Falls back to
   `done in …` when the reply was empty.
