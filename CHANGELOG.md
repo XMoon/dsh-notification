@@ -3,6 +3,11 @@
 ## Unreleased
 
 ### Added
+- **Session titles in every notification**: the summary is now `[<label>] <session title>`, read
+  from the Host's `ctx.sessionTitle.get(session)?.title` — the latest durable title, covering both
+  automatically generated and user-renamed ones. Applies to `Agent finished`, `Agent error`,
+  `Approval needed`, and `Question asked`. Without a title (or without the `session-title` plugin)
+  the summary falls back to the bare `[<label>]`.
 - **Subagent-tree settlement**: a completion waits for every descendant subagent run
   (`subagent/start` … `subagent/end`) of the delegating root session, then for the tree to stay
   idle for `settleDelayMs` (default 1s). Intermediate completions between steps are suppressed and

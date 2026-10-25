@@ -19,6 +19,9 @@ not once per intermediate step.
 | **Approval needed** | `approval/request` waterfall for the main agent (observe-only; always delegates with `next()`) | on |
 | **Question asked** | `user-questions/request` waterfall for the main agent (observe-only; never answers) | on |
 
+Each notification's summary carries the session title — `[Agent Finished] 面板设置优化实施流程` — so
+several running sessions stay distinguishable at a glance.
+
 Only the **main agent** is reported. Subagent activity never produces its own notification; it only
 delays the main completion until the whole delegation tree has settled. **Background jobs**
 (`run_in_background`) count too: the turn returns as soon as the job id is issued, so a job that is
@@ -119,14 +122,18 @@ Override the row in your profile's `cordis.patch.yml` (or via the Settings UI):
 
 ```json
 {
-  "text": "Agent finished — Refactored the parser and ran the full suite; all tests pass.",
-  "summary": "Agent finished",
+  "text": "[Agent Finished] 面板设置优化实施流程 — Refactored the parser and ran the full suite; all tests pass.",
+  "summary": "[Agent Finished] 面板设置优化实施流程",
   "body": "Refactored the parser and ran the full suite; all tests pass.",
   "level": "info",
   "ts": "2026-08-21T12:34:56.000Z"
 }
 ```
 
+`summary` is `[<label>] <session title>`, read from the Host's own `ctx.sessionTitle.get(session)`
+— the latest durable title, whether auto-generated or user-renamed. When the session has no title
+yet (or the Host does not mount `session-title`), the summary degrades to the bare `[<label>]`.
+The same format applies to `Agent error`, `Approval Needed`, and `Question Asked`.
 `body` is the last main-agent reply (whitespace collapsed, truncated to `maxBodyChars`), or
 `done in …` when that reply was empty. `text` stays `summary — body` for Slack-style consumers.
 

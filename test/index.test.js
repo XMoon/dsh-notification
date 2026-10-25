@@ -42,7 +42,7 @@ function sessionIdOf(agent) {
  * dispatch uses a real scope carrier, so `carrierKeyOf(this)` behaves exactly
  * as it does in the Host.
  */
-async function fixture(t, { overrides = {}, subagents, jobs } = {}) {
+async function fixture(t, { overrides = {}, subagents, jobs, titles } = {}) {
   const calls = captureWebhook(t)
   const app = new Context()
   const entries = []
@@ -74,6 +74,18 @@ async function fixture(t, { overrides = {}, subagents, jobs } = {}) {
       get events() { return jobs.events }
     }
     await app.plugin({ name: 'fixture-jobs', apply: (ctx) => { new JobsService(ctx) } })
+  }
+  if (titles) {
+    // Same surface the Host exposes: `ctx.sessionTitle.get(session)?.title`.
+    // `undefined` means the session has no durable title yet, as it does there.
+    class SessionTitleService extends Service {
+      constructor(ctx) { super(ctx, 'sessionTitle', true) }
+      get(session) {
+        const title = titles.get(sessionIdOf(session))
+        return title === undefined ? undefined : { title }
+      }
+    }
+    await app.plugin({ name: 'fixture-session-title', apply: (ctx) => { new SessionTitleService(ctx) } })
   }
   const fiber = await app.plugin({
     name: 'fixture-notification',
@@ -139,10 +151,59 @@ test('turn finish posts the last main reply once the duration gate passes', asyn
   await sleep(20)
 
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].payload.summary, 'Agent finished')
+  assert.equal(calls[0].payload.summary, '[Agent Finished]')
   assert.equal(calls[0].payload.level, 'info')
   assert.equal(calls[0].payload.body, 'refactored the parser and ran the suite')
-  assert.equal(calls[0].payload.text, 'Agent finished — refactored the parser and ran the suite')
+  assert.equal(calls[0].payload.text, '[Agent Finished] — refactored the parser and ran the suite')
+})
+
+test('the session title from ctx.sessionTitle tags the summary', async (t) => {
+  const titles = new Map([['root', '面板设置优化实施流程'], ['child', 'child title']])
+  const { calls, root, child, emit, status, waterfall } = await fixture(t, { titles })
+  const agent = root()
+  const sub = child('child')
+
+  status(agent, 'running')
+  status(agent, 'idle')
+  await sleep(20)
+  assert.equal(calls.at(-1).payload.summary, '[Agent Finished] 面板设置优化实施流程')
+  assert.equal(calls.at(-1).payload.text,
+    `[Agent Finished] 面板设置优化实施流程 — ${calls.at(-1).payload.body}`)
+
+  emit(agent, 'agent/error', { agent, turn: 1, step: 1, error: new Error('boom') })
+  assert.equal(calls.at(-1).payload.summary, '[Agent Error] 面板设置优化实施流程')
+
+  await waterfall(agent, 'approval/request', { agent, toolName: 'bash' }, () => Promise.resolve('allowed-once'))
+  assert.equal(calls.at(-1).payload.summary, '[Approval Needed] 面板设置优化实施流程')
+
+  await waterfall(agent, 'user-questions/request', { agent, questions: [{ id: 'q', question: 'Proceed?' }] },
+    () => Promise.resolve({ answers: [] }))
+  assert.equal(calls.at(-1).payload.summary, '[Question Asked] 面板设置优化实施流程')
+
+  // A subagent's own title never leaks into the main session's notification.
+  await waterfall(sub, 'approval/request', { agent: sub, toolName: 'bash' }, () => Promise.resolve('allowed-once'))
+  assert.equal(calls.filter(call => call.payload.summary.includes('child title')).length, 0)
+})
+
+test('without the sessionTitle service the summary keeps the bare label', async (t) => {
+  const { calls, root, status } = await fixture(t)
+  const agent = root()
+  status(agent, 'running')
+  status(agent, 'idle')
+  await sleep(20)
+
+  assert.equal(calls[0].payload.summary, '[Agent Finished]')
+})
+
+test('a whitespace-only session title is ignored', async (t) => {
+  const titles = new Map([['root', '  \t ']])
+  const { calls, root, status } = await fixture(t, { titles })
+  const agent = root()
+  status(agent, 'running')
+  status(agent, 'idle')
+  await sleep(20)
+
+  assert.equal(calls[0].payload.summary, '[Agent Finished]')
 })
 
 test('a turn below minTurnDurationMs stays quiet', async (t) => {
@@ -202,7 +263,7 @@ test('a subagent run defers the completion until it settles', async (t) => {
   emit(agent, 'subagent/end', { runId: 'run-1', id: 'child', provider: 'p', local: true, stopReason: 'completed' })
   await sleep(20)
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].payload.summary, 'Agent finished')
+  assert.equal(calls[0].payload.summary, '[Agent Finished]')
 })
 
 test('waitForSubagents:false completes as soon as the main agent is idle', async (t) => {
@@ -340,7 +401,7 @@ test('approval/request notifies the main agent AND always delegates to next()', 
   assert.equal(outcome, 'allowed-once', 'must return the downstream outcome unchanged')
   assert.equal(delegated, 1, 'observe-only waterfall listener must call next()')
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].payload.summary, 'Approval needed')
+  assert.equal(calls[0].payload.summary, '[Approval Needed]')
   assert.match(calls[0].payload.body, /bash — rm -rf build/)
 
   await waterfall(sub, 'approval/request', { agent: sub, toolName: 'bash' }, answer)
@@ -370,7 +431,7 @@ test('user-questions/request notifies once and leaves the answer untouched', asy
   const outcome = await waterfall(agent, 'user-questions/request', request, answer)
   assert.deepEqual(outcome, { answers: [{ id: 'q1', selected: ['main'] }] })
   assert.equal(calls.length, 1)
-  assert.equal(calls[0].payload.summary, 'Question asked')
+  assert.equal(calls[0].payload.summary, '[Question Asked]')
   assert.equal(calls[0].payload.body, 'Which branch? / Force push?')
 
   // The same request object re-dispatched must not alert twice.

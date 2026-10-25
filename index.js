@@ -188,6 +188,13 @@ export function apply(ctx, config) {
     jobRoot.clear()
   }, 'dsh-notification: settle timers')
 
+  // The latest durable title (auto-generated or user-renamed) of the agent's
+  // session, so a notification says *which* task finished.
+  function sessionSummary(label, agent) {
+    const title = service('sessionTitle')?.get?.(agent?.session)?.title?.trim()
+    return title ? `[${label}] ${title}` : `[${label}]`
+  }
+
   function notify(summary, body, level) {
     const text = body ? `${summary} — ${body}` : summary
     if (settings.desktop !== false) desktopNotify(settings.title ?? 'DeepSeek Harness', text)
@@ -293,7 +300,7 @@ export function apply(ctx, config) {
           const max = settings.maxBodyChars ?? 200
           // The fallback is a body like any other: maxBodyChars bounds it too.
           const content = boundText(state.reply, max) || boundText(`done in ${formatDuration(elapsed)}`, max)
-          notify('Agent finished', content, 'info')
+          notify(sessionSummary('Agent Finished', state.agent), content, 'info')
         }
         state.beganAt = null // only one notification per task group
         state.reply = ''
@@ -370,7 +377,7 @@ export function apply(ctx, config) {
     // The whole body is bounded, not just the error text: the maxBodyChars
     // contract covers every notification this plugin sends.
     const detail = error?.message ?? error ?? 'unknown error'
-    notify('Agent error', boundText(`turn ${turn ?? '?'}, step ${step ?? '?'}: ${detail}`,
+    notify(sessionSummary('Agent Error', agent), boundText(`turn ${turn ?? '?'}, step ${step ?? '?'}: ${detail}`,
       settings.maxBodyChars ?? 200), 'error')
   })
 
@@ -379,7 +386,7 @@ export function apply(ctx, config) {
   ctx.on('approval/request', (req, next) => {
     if (settings.notifyOnApproval !== false && req.agent && isMainAgent(req.agent)) {
       const detail = req.reason ? `${req.toolName} — ${req.reason}` : req.toolName
-      notify('Approval needed', boundText(detail, settings.maxBodyChars ?? 200), 'warn')
+      notify(sessionSummary('Approval Needed', req.agent), boundText(detail, settings.maxBodyChars ?? 200), 'warn')
     }
     return next()
   }, { prepend: true })
@@ -389,7 +396,7 @@ export function apply(ctx, config) {
       if (req && typeof req === 'object' && !questionsSeen.has(req)) {
         questionsSeen.add(req)
         const content = (req.questions ?? []).map(q => q.question).filter(Boolean).join(' / ')
-        notify('Question asked', boundText(content || 'Waiting for your answer', settings.maxBodyChars ?? 200), 'warn')
+        notify(sessionSummary('Question Asked', req.agent), boundText(content || 'Waiting for your answer', settings.maxBodyChars ?? 200), 'warn')
       }
     }
     return next()
